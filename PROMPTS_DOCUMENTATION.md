@@ -105,5 +105,95 @@ prompt:
 ]
 ```
 
+### 1.3 Model Selection (Выбор моделей)
+
+**Расположение:** `hugginggpt/server/configs/config.default.yaml` (строка 33-34)
+
+**Назначение:** На втором этапе работы HuggingGPT AI должен выбрать наиболее подходящую модель из списка доступных моделей для каждой задачи. Промт инструктирует AI фокусироваться на описании моделей и находить модель с наибольшим потенциалом для решения задачи. Предпочтение отдается моделям с локальными inference endpoints для скорости и стабильности.
+
+**Ключевые особенности:**
+- Выбор на основе описания модели и требований задачи
+- Предпочтение локальным endpoints для производительности
+- Выход в формате JSON с обоснованием выбора
+
+```yaml
+tprompt:
+  choose_model: >-
+    #2 Model Selection Stage: Given the user request and the parsed tasks, the AI assistant helps the user to select a suitable model from a list of models to process the user request. The assistant should focus more on the description of the model and find the model that has the most potential to solve requests and tasks. Also, prefer models with local inference endpoints for speed and stability.
+```
+
+**Дополнительный промт для конкретного выбора:**
+
+```yaml
+prompt:
+  choose_model: >-
+    Please choose the most suitable model from {{metas}} for the task {{task}}. The output must be in a strict JSON format: {"id": "id", "reason": "your detail reasons for the choice"}.
+```
+
+**Шаблон для Few-Shot примеров:**
+
+**Расположение:** `hugginggpt/server/demos/demo_choose_model.json`
+
+```json
+[
+    {
+        "role": "user",
+        "content": "{{input}}"
+    },
+    {
+        "role": "assistant",
+        "content": "{{task}}"
+    }
+]
+```
+
+Переменные {{input}} и {{task}} динамически заполняются пользовательским запросом и метаданными моделей во время выполнения.
+
+### 1.4 Response Generation (Генерация ответа)
+
+**Расположение:** `hugginggpt/server/configs/config.default.yaml` (строка 35-36)
+
+**Назначение:** На финальном четвертом этапе (stage #4) AI должен проанализировать логи выполнения задач и создать человеко-понятный ответ. AI должен описать процесс выполнения задач и результаты инференса, фильтруя нерелевантную информацию и предоставляя полные пути к файлам или URL результатов.
+
+**Ключевые особенности:**
+- Анализ логов выполнения и создание дружественного ответа
+- Описание рабочего процесса (workflow) включая использованные модели
+- Фильтрация нерелевантной информации
+- Предоставление полных путей/URL к результатам
+- Обработка случаев, когда инференс не дал результатов
+
+```yaml
+tprompt:
+  response_results: >-
+    #4 Response Generation Stage: With the task execution logs, the AI assistant needs to describe the process and inference results.
+```
+
+**Расширенный промт с инструкциями:**
+
+```yaml
+prompt:
+  response_results: >-
+    Yes. Please first think carefully and directly answer my request based on the inference results. Some of the inferences may not always turn out to be correct and require you to make careful consideration in making decisions. Then please detail your workflow including the used models and inference results for my request in your friendly tone. Please filter out information that is not relevant to my request. Tell me the complete path or urls of files in inference results. If there is nothing in the results, please tell me you can't make it.
+```
+
+**Шаблон для диалога:**
+
+**Расположение:** `hugginggpt/server/demos/demo_response_results.json`
+
+```json
+[
+    {
+        "role": "user",
+        "content": "{{input}}"
+    },
+    {
+        "role": "assistant",
+        "content": "Before give you a response, I want to introduce my workflow for your request, which is shown in the following JSON data: {{processes}}. Do you have any demands regarding my response?"
+    }
+]
+```
+
+Переменная {{processes}} заполняется информацией о выполненных задачах и использованных моделях.
+
 ---
 
