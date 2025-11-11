@@ -426,3 +426,523 @@ if "error" in task_str:
 
 ---
 
+## 2. TaskBench Pipelines - Бенчмарк планирования задач
+
+TaskBench предоставляет два типа пайплайнов в зависимости от типа зависимостей между задачами: Resource Dependency и Temporal Dependency.
+
+### 2.1 Общая архитектура
+
+TaskBench использует одноэтапный пайплайн для генерации плана задач с автоматическим восстановлением при ошибках формата.
+
+```
+┌─────────────────┐
+│  User Request   │
+│  + Tool List    │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────────────────────┐
+│   Task Planning Prompt          │
+│   (resource OR temporal)        │
+│   + Few-shot examples           │
+└────────┬────────────────────────┘
+         │ LLM генерирует JSON
+         ▼
+┌─────────────────────────────────┐
+│   JSON Parsing Attempt          │
+└────────┬────────────────────────┘
+         │
+         ├──[Success]──► Output: task_steps + task_nodes (+ task_links)
+         │
+         └──[JSON Error]
+                 │
+                 ▼
+         ┌─────────────────────────┐
+         │  Reformatting Prompt    │
+         │  (fix invalid JSON)     │
+         └────────┬────────────────┘
+                  │
+                  ▼
+         ┌─────────────────────────┐
+         │  Second Parsing Attempt │
+         └────────┬────────────────┘
+                  │
+                  ├──[Success]──► Output
+                  │
+                  └──[Fail]──► ContentFormatError
+```
+
+### 2.2 Pipeline Type 1: Resource Dependency
+
+**Назначение:** Для задач, где выходные данные одного инструмента используются как входные данные другого.
+
+**Используется для:**
+- HuggingFace models dataset
+- Multimedia tasks dataset
+
+**Схема работы:**
+
+```
+User Request: "Generate an image from text and then apply style transfer"
+
+                        ┌──────────────────┐
+                        │  Tool List       │
+                        │  • text-to-image │
+                        │  • image-to-image│
+                        │  • style-transfer│
+                        └────────┬─────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────┐
+│  PROMPT CONSTRUCTION                                    │
+│  ═══════════════════                                    │
+│                                                         │
+│  # TOOL LIST #:                                         │
+│  {"tool": "text-to-image", "input-type": ["text"],     │
+│   "output-type": ["image"]}                            │
+│  {"tool": "style-transfer", "input-type": ["image",    │
+│   "image"], "output-type": ["image"]}                  │
+│  ...                                                    │
+│                                                         │
+│  # GOAL #:                                              │
+│  Generate task steps and task nodes in JSON format:    │
+│  {"task_steps": [...], "task_nodes": [...]}            │
+│                                                         │
+│  # REQUIREMENTS #:                                      │
+│  1. Task name from TOOL LIST                           │
+│  2. Steps aligned with nodes                           │
+│  3. Dependencies via argument tags                     │
+│  4. Arguments align with input-type                    │
+│                                                         │
+│  [Few-shot examples if provided]                       │
+│                                                         │
+│  # USER REQUEST #: {user_request}                      │
+│  # RESULT #:                                            │
+└─────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────┐
+│  LLM OUTPUT (JSON)                                      │
+└─────────────────────────────────────────────────────────┘
+{
+  "task_steps": [
+    "Generate image from text using text-to-image",
+    "Apply style transfer to <node-0> using style-transfer"
+  ],
+  "task_nodes": [
+    {
+      "task": "text-to-image",
+      "arguments": ["a beautiful landscape"]
+    },
+    {
+      "task": "style-transfer",
+      "arguments": ["<node-0>", "van gogh style"]
+    }
+  ]
+}
+```
+
+**Формат выходных данных:**
+
+```json
+{
+  "task_steps": [
+    "Step 1 description",
+    "Step 2 description"
+  ],
+  "task_nodes": [
+    {
+      "task": "tool_name_from_list",
+      "arguments": [
+        "direct_value",
+        "<node-0>",  // Reference to output of task 0
+        "user_provided_filename.jpg"
+      ]
+    }
+  ]
+}
+```
+
+**Ключевые особенности:**
+
+1. **Зависимости через тег `<node-j>`:**
+   - `<node-0>` ссылается на выход задачи с индексом 0
+   - `<node-2>` ссылается на выход задачи с индексом 2
+
+2. **Type matching:**
+   - Проверка соответствия `output-type` предыдущей задачи и `input-type` текущей
+   - Пример: `text-to-image` (output: image) → `image-classification` (input: image)
+
+3. **Arguments format:**
+   - Простой список значений: `["arg1", "arg2", "<node-0>"]`
+   - Без явного указания имен параметров
+
+### 2.3 Pipeline Type 2: Temporal Dependency
+
+**Назначение:** Для задач, где важна последовательность выполнения (временная зависимость).
+
+**Используется для:**
+- Daily Life APIs dataset (реальные REST API)
+
+**Схема работы:**
+
+```
+User Request: "Book a flight and then reserve a hotel for the same dates"
+
+                        ┌──────────────────┐
+                        │  Tool List       │
+                        │  • search_flight │
+                        │  • book_flight   │
+                        │  • search_hotel  │
+                        │  • book_hotel    │
+                        └────────┬─────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────┐
+│  PROMPT CONSTRUCTION                                    │
+│  ═══════════════════                                    │
+│                                                         │
+│  # TOOL LIST #:                                         │
+│  {"tool": "search_flight", "parameters": ["origin",    │
+│   "destination", "date"]}                              │
+│  {"tool": "book_flight", "parameters": ["flight_id"]}  │
+│  ...                                                    │
+│                                                         │
+│  # GOAL #:                                              │
+│  Generate task steps, task nodes AND task links:       │
+│  {"task_steps": [...], "task_nodes": [...],            │
+│   "task_links": [...]}                                 │
+│                                                         │
+│  # REQUIREMENTS #:                                      │
+│  1. Task name from TOOL LIST                           │
+│  2. Steps aligned with nodes                           │
+│  3. task_links reflect temporal order                  │
+│                                                         │
+│  # USER REQUEST #: {user_request}                      │
+│  # RESULT #:                                            │
+└─────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────┐
+│  LLM OUTPUT (JSON)                                      │
+└─────────────────────────────────────────────────────────┘
+{
+  "task_steps": [
+    "Step 1: Call search_flight with origin: 'NYC' and destination: 'LAX'",
+    "Step 2: Call book_flight with flight_id: 'search_flight result'"
+  ],
+  "task_nodes": [
+    {
+      "task": "search_flight",
+      "arguments": [
+        {"name": "origin", "value": "NYC"},
+        {"name": "destination", "value": "LAX"}
+      ]
+    },
+    {
+      "task": "book_flight",
+      "arguments": [
+        {"name": "flight_id", "value": "search_flight"}
+      ]
+    }
+  ],
+  "task_links": [
+    {"source": "search_flight", "target": "book_flight"}
+  ]
+}
+```
+
+**Формат выходных данных:**
+
+```json
+{
+  "task_steps": [
+    "Step 1: Call tool_a with param1: 'value1' and param2: 'value2'",
+    "Step 2: Call tool_b with param1: 'tool_a result'"
+  ],
+  "task_nodes": [
+    {
+      "task": "tool_a",
+      "arguments": [
+        {"name": "param1", "value": "value1"},
+        {"name": "param2", "value": "value2"}
+      ]
+    },
+    {
+      "task": "tool_b",
+      "arguments": [
+        {"name": "param1", "value": "tool_a"}  // Reference by tool name
+      ]
+    }
+  ],
+  "task_links": [
+    {"source": "tool_a", "target": "tool_b"}
+  ]
+}
+```
+
+**Ключевые особенности:**
+
+1. **Task Links (временные связи):**
+   ```json
+   {"source": "task_i", "target": "task_j"}
+   ```
+   Означает: task_j должен выполниться ПОСЛЕ task_i
+
+2. **Зависимости через имя инструмента:**
+   - `"value": "search_flight"` означает использовать результат инструмента search_flight
+   - Не через индекс, а через имя задачи
+
+3. **Named Arguments:**
+   - Каждый аргумент - объект с `name` и `value`
+   - `[{"name": "param", "value": "val"}]`
+
+4. **Explicit Step Format:**
+   - Строгий формат: `"Step X: Call tool_name with param: 'value'"`
+
+### 2.4 JSON Reformatting (Error Recovery)
+
+Когда первая попытка парсинга JSON не удается, TaskBench автоматически пытается исправить формат.
+
+**Схема восстановления:**
+
+```
+┌──────────────────────────┐
+│  Invalid JSON detected   │
+│  by json.loads()         │
+└───────────┬──────────────┘
+            │
+            ▼
+    ┌──────────────────┐
+    │  reformat == True?│
+    └───────┬──────────┘
+            │
+      [YES] │
+            ▼
+┌──────────────────────────────────────┐
+│  Reformatting Prompt                 │
+│  ════════════════════                │
+│                                      │
+│  "Please format # RESULT # to       │
+│  strict JSON format                 │
+│  # STRICT JSON FORMAT #"            │
+│                                      │
+│  Requirements:                       │
+│  1. Don't change meaning            │
+│  2. Ensure json.loads() compatible  │
+│  3. Match required schema           │
+│                                      │
+│  # RESULT #: {illegal_result}       │
+│  # STRICT JSON FORMAT #:            │
+└───────────┬──────────────────────────┘
+            │
+            ▼
+┌──────────────────────────────────────┐
+│  Second LLM Call                     │
+│  (using same or different model)    │
+└───────────┬──────────────────────────┘
+            │
+            ▼
+    ┌───────────────┐
+    │ Parse attempt │
+    └───────┬───────┘
+            │
+            ├──[Success]──► Return result
+            │
+            └──[Fail]──► Raise ContentFormatError
+```
+
+**Пример исправления:**
+
+*Исходный невалидный JSON:*
+```
+{task_steps: ["Step 1", "Step 2"], task_nodes: [{task: "tool1", arguments: ["arg1"]}]}
+```
+
+*Промт для исправления:*
+```
+Please format the result # RESULT # to a strict JSON format.
+
+Requirements:
+1. Do not change the meaning
+2. Ensure json.loads() compatible
+3. Output must match schema
+
+# RESULT #: {task_steps: [...], task_nodes: [...]}
+# STRICT JSON FORMAT #:
+```
+
+*Исправленный JSON:*
+```json
+{"task_steps": ["Step 1", "Step 2"], "task_nodes": [{"task": "tool1", "arguments": ["arg1"]}]}
+```
+
+### 2.5 Конфигурация и параметры
+
+**LLM параметры:**
+- `model`: "gpt-4" / "gpt-3.5-turbo"
+- `temperature`: 0.2 (небольшая случайность)
+- `top_p`: 0.1 (фокус на наиболее вероятных токенах)
+- `max_tokens`: 2000
+- `frequency_penalty`: 0
+- `presence_penalty`: 1.05 (избегать повторений)
+
+**Few-shot примеры:**
+- HuggingFace dataset: 3 примера (IDs: 10523150, 14611002, 22067492)
+- Multimedia dataset: 3 примера (IDs: 30934207, 20566230, 19003517)
+- Daily Life APIs: 3 примера (IDs: 38563456, 27267145, 91005535)
+
+**Опции:**
+- `use_demos`: 0-3 (количество few-shot примеров)
+- `reformat`: true/false (включить автоисправление JSON)
+- `reformat_by`: "self" / model_name (модель для исправления)
+
+### 2.6 Полный пример: Resource Dependency
+
+**Входные данные:**
+
+```python
+user_request = "Detect objects in image.jpg and describe what you see"
+tool_list = [
+    {"tool": "object-detection", "input-type": ["image"], "output-type": ["detection"]},
+    {"tool": "image-to-text", "input-type": ["image"], "output-type": ["text"]},
+    {"tool": "text-classification", "input-type": ["text"], "output-type": ["label"]}
+]
+```
+
+**Промт (упрощенно):**
+
+```
+# TASK LIST #:
+{"tool": "object-detection", "input-type": ["image"], "output-type": ["detection"]}
+{"tool": "image-to-text", "input-type": ["image"], "output-type": ["text"]}
+
+# GOAL #: Generate task steps and task nodes...
+# USER REQUEST #: Detect objects in image.jpg and describe what you see
+# RESULT #:
+```
+
+**Выход LLM:**
+
+```json
+{
+  "task_steps": [
+    "Detect objects in the image using object-detection",
+    "Generate description of the image using image-to-text"
+  ],
+  "task_nodes": [
+    {
+      "task": "object-detection",
+      "arguments": ["image.jpg"]
+    },
+    {
+      "task": "image-to-text",
+      "arguments": ["image.jpg"]
+    }
+  ]
+}
+```
+
+### 2.7 Полный пример: Temporal Dependency
+
+**Входные данные:**
+
+```python
+user_request = "Search for flights from NYC to SF and book the cheapest one"
+tool_list = [
+    {"tool": "search_flights", "parameters": ["origin", "destination"]},
+    {"tool": "get_flight_price", "parameters": ["flight_id"]},
+    {"tool": "book_flight", "parameters": ["flight_id"]}
+]
+```
+
+**Промт (упрощенно):**
+
+```
+# TASK LIST #:
+{"tool": "search_flights", "parameters": ["origin", "destination"]}
+{"tool": "get_flight_price", "parameters": ["flight_id"]}
+{"tool": "book_flight", "parameters": ["flight_id"]}
+
+# GOAL #: Generate task steps, task nodes, and task links...
+# USER REQUEST #: Search for flights from NYC to SF and book the cheapest one
+# RESULT #:
+```
+
+**Выход LLM:**
+
+```json
+{
+  "task_steps": [
+    "Step 1: Call search_flights with origin: 'NYC' and destination: 'SF'",
+    "Step 2: Call get_flight_price with flight_id: 'search_flights result'",
+    "Step 3: Call book_flight with flight_id: 'cheapest flight from step 2'"
+  ],
+  "task_nodes": [
+    {
+      "task": "search_flights",
+      "arguments": [
+        {"name": "origin", "value": "NYC"},
+        {"name": "destination", "value": "SF"}
+      ]
+    },
+    {
+      "task": "get_flight_price",
+      "arguments": [
+        {"name": "flight_id", "value": "search_flights"}
+      ]
+    },
+    {
+      "task": "book_flight",
+      "arguments": [
+        {"name": "flight_id", "value": "get_flight_price"}
+      ]
+    }
+  ],
+  "task_links": [
+    {"source": "search_flights", "target": "get_flight_price"},
+    {"source": "get_flight_price", "target": "book_flight"}
+  ]
+}
+```
+
+### 2.8 Сравнение двух типов пайплайнов
+
+| Аспект | Resource Dependency | Temporal Dependency |
+|--------|---------------------|---------------------|
+| **Тип зависимости** | По типу данных (image→text) | По времени (A должно быть до B) |
+| **Формат аргументов** | Простой список `["arg1", "<node-0>"]` | Named `[{"name": "x", "value": "y"}]` |
+| **Ссылка на результат** | По индексу `<node-0>` | По имени инструмента `"tool_name"` |
+| **Task Links** | Нет (неявные через args) | Да, явные `{"source": "A", "target": "B"}` |
+| **Type checking** | Да (input-type/output-type) | Нет |
+| **Применение** | NLP/CV конвейеры | REST API orchestration |
+| **Step format** | Произвольный текст | Строгий: "Step X: Call..." |
+
+### 2.9 Обработка ошибок
+
+**Типы ошибок:**
+
+1. **RateLimitError (429):** Слишком много запросов к API
+2. **ContentFormatError:** JSON не валиден даже после reformatting
+3. **JSONDecodeError:** Первичная ошибка парсинга (триггер reformatting)
+
+**Error handling flow:**
+
+```python
+try:
+    content = json.loads(response)
+    return content
+except JSONDecodeError:
+    if reformat:
+        # Попытка исправления
+        reformatted = call_reformat_prompt(content)
+        try:
+            return json.loads(reformatted)
+        except JSONDecodeError:
+            raise ContentFormatError
+    else:
+        raise ContentFormatError
+```
+
+---
+
