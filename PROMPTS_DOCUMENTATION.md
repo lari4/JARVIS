@@ -197,3 +197,82 @@ prompt:
 
 ---
 
+## 2. TaskBench - Система планирования и декомпозиции задач
+
+TaskBench - это benchmark система для тестирования способностей LLM декомпозировать сложные задачи на простые шаги с использованием различных инструментов. Поддерживает два типа зависимостей: resource dependency (зависимость по ресурсам) и temporal dependency (временная зависимость).
+
+### 2.1 Task Planning - Resource Dependency (Планирование с зависимостями по ресурсам)
+
+**Расположение:** `taskbench/inference.py` (строка 175-176)
+
+**Назначение:** Этот промт используется для генерации шагов задачи и узлов задачи с зависимостями по ресурсам. AI должен разбить пользовательский запрос на последовательные шаги, где выходные данные одного шага могут использоваться как входные данные для другого. Используется для данных HuggingFace и мультимедиа.
+
+**Ключевые особенности:**
+- Строгий формат JSON вывода с task_steps и task_nodes
+- Использование тегов `<node-j>` для ссылки на выход j-го узла
+- Проверка соответствия типов входных данных (input-type) и выходных данных (output-type)
+- Минимизация количества шагов при полном решении запроса
+
+```python
+prompt = """\n# GOAL #: Based on the above tools, I want you generate task steps and task nodes to solve the # USER REQUEST #. The format must in a strict JSON format, like: {"task_steps": [ step description of one or more steps ], "task_nodes": [{"task": "tool name must be from # TOOL LIST #", "arguments": [ a concise list of arguments for the tool. Either original text, or user-mentioned filename, or tag '<node-j>' (start from 0) to refer to the output of the j-th node. ]}]} """
+
+prompt += """\n\n# REQUIREMENTS #: \n1. the generated task steps and task nodes can resolve the given user request # USER REQUEST # perfectly. Task name must be selected from # TASK LIST #; \n2. the task steps should strictly aligned with the task nodes, and the number of task steps should be same with the task nodes; \n3. the dependencies among task steps should align with the argument dependencies of the task nodes; \n4. the tool arguments should be align with the input-type field of # TASK LIST #;"""
+```
+
+**Пример использования с демо-данными:**
+
+```python
+prompt += f"""\n# EXAMPLE #:\n# USER REQUEST #: {demo["user_request"]}\n# RESULT #: {json.dumps(demo["result"])}"""
+```
+
+**Финальная часть промта:**
+
+```python
+prompt += """\n\n# USER REQUEST #: {{user_request}}\nnow please generate your result in a strict JSON format:\n# RESULT #:"""
+```
+
+### 2.2 Task Planning - Temporal Dependency (Планирование с временными зависимостями)
+
+**Расположение:** `taskbench/inference.py` (строка 178-179)
+
+**Назначение:** Этот промт используется для генерации шагов задачи с временными зависимостями. В отличие от resource dependency, здесь явно указывается порядок вызова API через поле task_links. Используется для данных Daily Life APIs, где важна последовательность выполнения операций.
+
+**Ключевые особенности:**
+- Включает поле task_links для указания временной последовательности
+- Формат шагов: "Step x: Call xxx tool with xxx: 'xxx' and xxx: 'xxx'"
+- Аргументы с именем и значением параметра
+- Явная спецификация зависимостей источник->цель
+
+```python
+prompt = """\n# GOAL #:\nBased on the above tools, I want you generate task steps and task nodes to solve the # USER REQUEST #. The format must in a strict JSON format, like: {"task_steps": [ "concrete steps, format as Step x: Call xxx tool with xxx: 'xxx' and xxx: 'xxx'" ], "task_nodes": [{"task": "task name must be from # TASK LIST #", "arguments": [ {"name": "parameter name", "value": "parameter value, either user-specified text or the specific name of the tool whose result is required by this node"} ]}], "task_links": [{"source": "task name i", "target": "task name j"}]}"""
+
+prompt += """\n\n# REQUIREMENTS #: \n1. the generated task steps and task nodes can resolve the given user request # USER REQUEST # perfectly. Task name must be selected from # TASK LIST #; \n2. the task steps should strictly aligned with the task nodes, and the number of task steps should be same with the task nodes; \n3. The task links (task_links) should reflect the temporal dependencies among task nodes, i.e. the order in which the APIs are invoked;"""
+```
+
+### 2.3 JSON Reformatting - Resource Dependency (Переформатирование для Resource)
+
+**Расположение:** `taskbench/inference.py` (строка 251)
+
+**Назначение:** Когда LLM генерирует некорректный JSON, этот промт используется для исправления формата без изменения смысла. Это recovery mechanism для обработки ошибок парсинга.
+
+**Ключевые особенности:**
+- Исправление формата без изменения смысла
+- Гарантия совместимости с json.loads()
+- Сохранение исходной структуры задачи
+
+```python
+prompt = """Please format the result # RESULT # to a strict JSON format # STRICT JSON FORMAT #. \nRequirements:\n1. Do not change the meaning of task steps and task nodes;\n2. Don't tolerate any possible irregular formatting to ensure that the generated content can be converted by json.loads();\n3. You must output the result in this schema: {"task_steps": [ step description of one or more steps ], "task_nodes": [{"task": "tool name must be from # TOOL LIST #", "arguments": [ a concise list of arguments for the tool. Either original text, or user-mentioned filename, or tag '<node-j>' (start from 0) to refer to the output of the j-th node. ]}]}\n# RESULT #:{{illegal_result}}\n# STRICT JSON FORMAT #:"""
+```
+
+### 2.4 JSON Reformatting - Temporal Dependency (Переформатирование для Temporal)
+
+**Расположение:** `taskbench/inference.py` (строка 253)
+
+**Назначение:** Аналогичен промту для resource dependency, но включает дополнительную обработку task_links.
+
+```python
+prompt = """Please format the result # RESULT # to a strict JSON format # STRICT JSON FORMAT #. \nRequirements:\n1. Do not change the meaning of task steps, task nodes and task links;\n2. Don't tolerate any possible irregular formatting to ensure that the generated content can be converted by json.loads();\n3. Pay attention to the matching of brackets. Write in a compact format and avoid using too many space formatting controls;\n4. You must output the result in this schema: {"task_steps": [ "concrete steps, format as Step x: Call xxx tool with xxx: 'xxx' and xxx: 'xxx'" ], "task_nodes": [{"task": "task name must be from # TASK LIST #", "arguments": [ {"name": "parameter name", "value": "parameter value, either user-specified text or the specific name of the tool whose result is required by this node"} ]}], "task_links": [{"source": "task name i", "target": "task name j"}]}\n# RESULT #:{{illegal_result}}\n# STRICT JSON FORMAT #:"""
+```
+
+---
+
