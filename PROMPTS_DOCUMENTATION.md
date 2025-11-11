@@ -276,3 +276,318 @@ prompt = """Please format the result # RESULT # to a strict JSON format # STRICT
 
 ---
 
+## 3. EasyTool - Система интеграции и оркестрации API инструментов
+
+EasyTool - это framework для работы с API инструментами, который включает выбор инструментов, декомпозицию задач, извлечение параметров и генерацию ответов. Система работает с различными типами API (ToolBench, FuncQA, RestBench).
+
+### 3.1 Tool Selection (Выбор инструмента)
+
+**Расположение:** `easytool/easytool/toolbench.py` (строка 48-60) и `easytool/easytool/funcQA.py` (строка 48-61)
+
+**Назначение:** Этот промт используется для выбора одного наиболее подходящего инструмента из списка доступных инструментов для решения пользовательского вопроса. AI должен проанализировать вопрос и выбрать единственный инструмент, который лучше всего подходит для решения задачи.
+
+**Ключевые особенности:**
+- Выбор только одного инструмента из списка
+- Выход в формате JSON с ID инструмента
+- Использование Tool List с ID и описаниями
+
+```python
+template = "You are a helpful assistant."
+human_message_prompt = HumanMessagePromptTemplate.from_template(
+    "This is the user's question: {question}\n"
+    "These are the tools you can select to solve the question:\n"
+    "Tool List:\n"
+    "{Too_list}\n\n"
+    "Please note that: \n"
+    "1. You should only chooce one tool the Tool List to solve this question.\n"
+    "2. You must ONLY output the ID of the tool you chose in a parsible JSON format. Two example outputs look like:\n"
+    "'''\n"
+    "Example 1: {{\"ID\": 1}}\n"
+    "Example 2: {{\"ID\": 2}}\n"
+    "'''\n"
+    "Output:"
+)
+```
+
+### 3.2 API Selection (Выбор API)
+
+**Расположение:** `easytool/easytool/toolbench.py` (строка 84-108)
+
+**Назначение:** После выбора инструмента, этот промт используется для выбора конкретных API из инструкции к инструменту. AI может выбрать несколько API для решения вопроса.
+
+**Ключевые особенности:**
+- Выбор нескольких API из списка
+- Использование API instruction для контекста
+- Выход в формате Python List
+
+```python
+input_execute_rapidapi_api_note = '''
+This is an API Tool instruction. Given a question, you should choose APIs from the API list you want to use for this question in this instruction.
+you must only output in a parsible Python List Format. An example output looks like:
+```
+["api1", "api2", ...]
+```
+'''.strip()
+
+human_message_prompt = HumanMessagePromptTemplate.from_template(
+    "{API_instruction}\n"
+    "{input_execute_rapidapi_api_note}\n"
+    "This is the API list: {API_list}\n"
+    "Please note that: \n"
+    "1. The APIs you choose must in the API list.\n"
+    "2. You must ONLY output in the following parsible Python List Format.\n"
+    "```\n"
+    "Output_Example: [\"api1\", \"api2\", ...]\n"
+    "```\n"
+    "Question: {question}\n"
+    "Output:"
+)
+```
+
+### 3.3 Parameter Extraction (Извлечение параметров)
+
+**Расположение:** `easytool/easytool/toolbench.py` (строка 139-158) и `easytool/easytool/funcQA.py` (строка 195-214)
+
+**Назначение:** Этот промт используется для извлечения параметров API из вопроса пользователя на основе документации API. AI должен сгенерировать корректные параметры для вызова API.
+
+**Ключевые особенности:**
+- Генерация required и optional параметров
+- Поддержка множественных вызовов API (параметры в виде списка)
+- Использование примеров из документации
+- Выход в формате JSON
+
+```python
+human_message_prompt = HumanMessagePromptTemplate.from_template(
+    "This is an API tool documentation. Given a user's question, you need to output parameters according to the API tool documentation to successfully call the API to solve the user's question.\n"
+    "This is API tool documentation: {api_dic}\n"
+    "Please note that: \n"
+    "1. The Example in the API tool documentation can help you better understand the use of the API.\n"
+    "2. Ensure the parameters you output are correct. The output must contain the required parameters, and can contain the optional parameters based on the question. If no paremters in the required parameters and optional parameters, just leave it as {{\"Parameters\":{{}}}}\n"
+    "3. If the user's question mentions other APIs, you should ONLY consider the API tool documentation I give and do not consider other APIs.\n"
+    "4. If you need to use this API multiple times, please set \"Parameters\" to a list.\n"
+    "5. You must ONLY output in a parsible JSON format. Two examples output looks like:\n"
+    "'''\n"
+    "Example 1: {{\"Parameters\":{{\"keyword\": \"Artificial Intelligence\", \"language\": \"English\"}}}}\n"
+    "Example 2: {{\"Parameters\":[{{\"keyword\": \"Artificial Intelligence\", \"language\": \"English\"}}, {{\"keyword\": \"Machine Learning\", \"language\": \"English\"}}]}}\n"
+    "'''\n"
+    "This is user's question: {question}\n"
+    "Output:\n"
+)
+```
+
+### 3.4 Parameter Extraction with Dependencies (Извлечение параметров с зависимостями)
+
+**Расположение:** `easytool/easytool/toolbench.py` (строка 181-203) и `easytool/easytool/funcQA.py` (строка 237-258)
+
+**Назначение:** Расширенная версия промта для извлечения параметров, которая учитывает зависимости от предыдущих вызовов API. AI может использовать результаты предыдущих API для формирования параметров текущего API.
+
+**Ключевые особенности:**
+- Использование логов предыдущих вопросов и ответов
+- Поддержка зависимостей между последовательными API вызовами
+- Контекстно-зависимая генерация параметров
+
+```python
+human_message_prompt = HumanMessagePromptTemplate.from_template(
+    "Given a user's question and a API tool documentation, you need to output parameters according to the API tool documentation to successfully call the API to solve the user's question.\n"
+    "Please note that: \n"
+    "1. The Example in the API tool documentation can help you better understand the use of the API.\n"
+    "2. Ensure the parameters you output are correct. The output must contain the required parameters, and can contain the optional parameters based on the question. If no paremters in the required parameters and optional parameters, just leave it as {{\"Parameters\":{{}}}}\n"
+    "3. If the user's question mentions other APIs, you should ONLY consider the API tool documentation I give and do not consider other APIs.\n"
+    "4. The question may have dependencies on answers of other questions, so we will provide logs of previous questions and answers for your reference.\n"
+    "5. If you need to use this API multiple times,, please set \"Parameters\" to a list.\n"
+    "6. You must ONLY output in a parsible JSON format. Two examples output looks like:\n"
+    "'''\n"
+    "Example 1: {{\"Parameters\":{{\"keyword\": \"Artificial Intelligence\", \"language\": \"English\"}}}}\n"
+    "Example 2: {{\"Parameters\":[{{\"keyword\": \"Artificial Intelligence\", \"language\": \"English\"}}, {{\"keyword\": \"Machine Learning\", \"language\": \"English\"}}]}}\n"
+    "'''\n"
+    "There are logs of previous questions and answers: \n {previous_log}\n"
+    "This is the current user's question: {question}\n"
+    "This is API tool documentation: {api_dic}\n"
+    "Output:\n"
+)
+```
+
+### 3.5 Task Decomposition (Декомпозиция задач)
+
+**Расположение:** `easytool/easytool/funcQA.py` (строка 88-106)
+
+**Назначение:** Этот промт используется для разбиения сложного вопроса пользователя на простые подзадачи, каждая из которых может быть выполнена одним инструментом.
+
+**Ключевые особенности:**
+- Разбиение на простые подзадачи
+- Указание зависимостей между задачами (использование результатов X, Y)
+- Каждая подзадача выполняется одним инструментом
+
+```python
+human_message_prompt = HumanMessagePromptTemplate.from_template(
+    "You need to decompose a complex user's question into some simple subtasks and let the model execute it step by step.\n"
+    "This is the user's question: {question}\n"
+    "This is tool list:\n"
+    "{Tool_list}\n"
+    "Please note that: \n"
+    "1. You should only decompose this complex user's question into some simple subtasks which can be executed easily by using one single tool in the tool list.\n"
+    "2. If one subtask need the results from other subtask, you can should write clearly. For example:"
+    "{{\"Tasks\": [\"Convert 23 km/h to X km/min by 'divide_'\", \"Multiply X km/min by 45 min to get Y by 'multiply_'\"]}}\n"
+    "3. You must ONLY output in a parsible JSON format. An example output looks like:\n"
+    "'''\n"
+    "{{\"Tasks\": [\"Task 1\", \"Task 2\", ...]}}\n"
+    "'''\n"
+    "Output:"
+)
+```
+
+### 3.6 Task Topology (Топология задач)
+
+**Расположение:** `easytool/easytool/funcQA.py` (строка 128-145)
+
+**Назначение:** Этот промт используется для определения логических связей и порядка выполнения подзадач, включая зависимости между ними.
+
+**Ключевые особенности:**
+- Определение зависимостей между задачами
+- Построение графа выполнения задач
+- Идентификация задач без зависимостей (dep: -1)
+
+```python
+human_message_prompt = HumanMessagePromptTemplate.from_template(
+    "Given a complex user's question, I have decompose this question into some simple subtasks"
+    "I think there exists a logical connections and order amontg the tasks. "
+    "Thus you need to help me output this logical connections and order.\n"
+    "You must ONLY output in a parsible JSON format with the following format:\n"
+    "'''\n"
+    "[{{\"task\": task, \"id\", task_id, \"dep\": [dependency_task_id1, dependency_task_id2, ...]}}]\n"
+    "'''\n"
+    "The \"dep\" field denotes the id of the previous task which generates a new resource upon which the current task depends. If there are no dependencies, set \"dep\" to -1.\n\n"
+    "This is user's question: {question}\n"
+    "These are subtasks of this question:\n"
+    "{task_ls}\n"
+    "Output: "
+)
+```
+
+### 3.7 Task Decomposition for RestBench (Декомпозиция для REST API)
+
+**Расположение:** `easytool/easytool/restbench.py` (строка 46-66)
+
+**Назначение:** Специализированный промт для декомпозиции задач при работе с REST API (например, Spotify API). Включает выбор конкретных инструментов по ID для каждой подзадачи.
+
+**Ключевые особенности:**
+- Работа с базой данных (Spotify)
+- Указание ID инструмента для каждой подзадачи
+- Учет логических связей, порядка и ограничений между инструментами
+- Поддержка задач без инструментов (ID: -1)
+
+```python
+human_message_prompt = HumanMessagePromptTemplate.from_template(
+    "We have spotify database and the following tools:\n"
+    "{Tool_dic}"
+    "You need to decompose a complex user's question into some simple subtasks and let the model execute it step by step with these tools.\n"
+    "Please note that: \n"
+    "1. you should break down tasks into appropriate subtasks to use the tools mentioned above.\n"
+    "2. You should not only list the subtask, but also list the ID of the tool used to solve this subtask.\n"
+    "3. If you think you do not need to use the tool to solve the subtask, just leave it as {{\"ID\": -1}}\n"
+    "4. You must consider the logical connections, order and constraints among the tools to achieve a correct tool path."
+    "5. You must ONLY output the ID of the tool you chose in a parsible JSON format. Two examples output look like:\n"
+    "'''\n"
+    "Question: Pause the player"
+    "Example 1: [{{\"Task\":\"Get information about the user's current playback state\", \"ID\":15}}, {{\"Task\":\"Pause playback on the user's account\", \"ID\":19}}]\n"
+    "'''\n"
+    "This is the user's question: {question}\n"
+    "Output:"
+)
+```
+
+### 3.8 Answer Generation (Генерация ответа)
+
+**Расположение:** `easytool/easytool/toolbench.py` (строка 226-240)
+
+**Назначение:** Этот промт используется для генерации естественного языкового ответа на основе результата вызова API. AI должен преобразовать технический вывод API в понятный пользователю ответ.
+
+**Ключевые особенности:**
+- Преобразование API response в естественный язык
+- Детальное использование информации из ответа
+- Пользователь не видит прямой ответ API
+
+```python
+human_message_prompt = HumanMessagePromptTemplate.from_template(
+    "You should answer the question based on the response output by the API tool."
+    "Please note that:\n"
+    "1. Answer the question in natural language based on the API response reasonably and effectively.\n"
+    "2. The user cannot directly get API response, "
+    "so you need to make full use of the response and give the information "
+    "in the response that can satisfy the user's question in as much detail as possible.\n"
+    "This is the user's question:\n {question}\n"
+    "This is the API response:\n {call_result}\n"
+    "Output:"
+)
+```
+
+### 3.9 Answer Generation with Dependencies (Генерация ответа с зависимостями)
+
+**Расположение:** `easytool/easytool/toolbench.py` (строка 258-277)
+
+**Назначение:** Расширенная версия промта для генерации ответа, которая учитывает зависимости от предыдущих вопросов и ответов.
+
+```python
+human_message_prompt = HumanMessagePromptTemplate.from_template(
+    "You should answer the question based on the response output by the API tool."
+    "Please note that:\n"
+    "1. Try to organize the response into a natural language answer.\n"
+    "2. We will not show the API response to the user, "
+    "thus you need to make full use of the response and give the information "
+    "in the response that can satisfy the user's question in as much detail as possible.\n"
+    "3. The question may have dependencies on answers of other questions, so we will provide logs of previous questions and answers.\n"
+    "There are logs of previous questions and answers: \n {previous_log}\n"
+    "This is the user's question: {question}\n"
+    "This is the response output by the API tool: \n{call_result}\n"
+    "We will not show the API response to the user, "
+    "thus you need to make full use of the response and give the information "
+    "in the response that can satisfy the user's question in as much detail as possible.\n"
+    "Output:"
+)
+```
+
+### 3.10 Direct Answer Generation (Прямая генерация ответа без API)
+
+**Расположение:** `easytool/easytool/funcQA.py` (строка 180-192)
+
+**Назначение:** Fallback промт для случаев, когда вопрос можно ответить напрямую без использования инструментов.
+
+**Ключевые особенности:**
+- Простой прямой ответ на вопрос
+- Не требует вызова API
+- Используется для общих вопросов
+
+```python
+human_message_prompt = HumanMessagePromptTemplate.from_template(
+    "You need to answer the user's question.\n"
+    "This is the user's question: {task}\n"
+    "Output:"
+)
+```
+
+### 3.11 Answer Verification (Проверка ответа)
+
+**Расположение:** `easytool/easytool/toolbench.py` (строка 296-316)
+
+**Назначение:** Этот промт используется для проверки, может ли сгенерированный ответ разумно и точно ответить на вопрос пользователя.
+
+**Ключевые особенности:**
+- Валидация качества ответа
+- Обоснование решения (Reason)
+- Бинарный выбор: Yes/No
+
+```python
+human_message_prompt = HumanMessagePromptTemplate.from_template(
+    "Please check whether the response can reasonably and accurately answer the question."
+    "If can, please output 'YES'; If not, please output 'NO'\n"
+    "You need to give reasons first and then decide whether the response can reasonably and accurately answer the question. You must only output in a parsible JSON format. Two example outputs look like:\n"
+    "Example 1: {{\"Reason\": \"The reason why you think the response can reasonably and accurately answer the question\", \"Choice\": \"Yes\"}}\n"
+    "Example 2: {{\"Reason\": \"The reason why you think the response cannot reasonably and accurately answer the question\", \"Choice\": \"No\"}}\n"
+    "This is the user's question: {question}\n"
+    "This is the response: {answer}\n"
+    "Output: "
+)
+```
+
+---
+
