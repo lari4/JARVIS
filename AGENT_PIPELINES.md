@@ -946,3 +946,711 @@ except JSONDecodeError:
 
 ---
 
+## 3. EasyTool Pipelines - API оркестрация и выполнение
+
+EasyTool предоставляет четыре различных пайплайна для работы с API инструментами, каждый оптимизирован для своего типа задач.
+
+### 3.1 Обзор пайплайнов
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    EasyTool Framework                        │
+└──────────────────────────────────────────────────────────────┘
+                              │
+          ┌───────────────────┼───────────────────┐
+          │                   │                   │
+          ▼                   ▼                   ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│   FuncQA        │  │   ToolBench     │  │   RestBench     │
+│   Multi-hop     │  │   API Selection │  │   Task Decomp   │
+└─────────────────┘  └─────────────────┘  └─────────────────┘
+        │                     │                     │
+        │           ┌─────────┴─────────┐          │
+        │           │                   │          │
+        ▼           ▼                   ▼          ▼
+    Task         Tool              Tool + API    Task
+    Decompose    Selection         with RAG      Decompose
+    + Topology   + API Choice      (Retrieval)   for REST
+                 + Parameters
+```
+
+**Сравнение пайплайнов:**
+
+| Пайплайн | Назначение | Декомпозиция | Зависимости | Retrieval |
+|----------|-----------|--------------|-------------|-----------|
+| **FuncQA-MH** | Математические функции (Multi-Hop) | ✅ Task Decompose + Topology | ✅ Через previous_log | ❌ |
+| **FuncQA-OH** | Математические функции (One-Hop) | ❌ | ❌ | ❌ |
+| **ToolBench** | API инструменты | ❌ | ✅ Sequential | ❌ |
+| **ToolBench-RAG** | API инструменты с retrieval | ❌ | ✅ Sequential | ✅ Semantic search |
+| **RestBench** | REST API (Spotify, TMDB) | ✅ Task Decompose | ❌ | ❌ |
+
+---
+
+### 3.2 Pipeline 1: FuncQA Multi-Hop (Мультихоп функции)
+
+**Назначение:** Решение сложных вопросов, требующих последовательного вызова нескольких функций с зависимостями.
+
+**Пример задачи:** "Convert 23 km/h to km/min and then multiply by 45"
+
+**Полная схема пайплайна:**
+
+```
+┌──────────────────┐
+│  User Question   │
+│  + Tool List     │
+└────────┬─────────┘
+         │
+         ▼
+┌─────────────────────────────────┐
+│  STAGE 1: Task Decomposition    │
+│  Промт: task_decompose          │
+│  Разбить вопрос на подзадачи    │
+└────────┬────────────────────────┘
+         │ Output: {"Tasks": ["Task 1", "Task 2", ...]}
+         ▼
+┌─────────────────────────────────┐
+│  STAGE 2: Task Topology         │
+│  Промт: task_topology           │
+│  Определить зависимости         │
+└────────┬────────────────────────┘
+         │ Output: [{"task": "...", "id": 0, "dep": [-1]}, ...]
+         ▼
+         │
+         ├──► Цикл по задачам (в порядке зависимостей)
+         │
+         └───────┐
+                 ▼
+         ┌───────────────────────────┐
+         │  Задача без зависимостей  │
+         │  или с выполненными dep   │
+         └───────┬───────────────────┘
+                 │
+                 ▼
+         ┌─────────────────────────────────┐
+         │  STAGE 3A: Tool Selection       │
+         │  Промт: choose_tool             │
+         │  Выбрать инструмент             │
+         └────────┬────────────────────────┘
+                  │ Output: {"ID": tool_id}
+                  ▼
+         ┌─────────────────────────────────┐
+         │  STAGE 3B: API Selection        │
+         │  (если нужно)                   │
+         └────────┬────────────────────────┘
+                  │
+                  ▼
+         ┌─────────────────────────────────┐
+         │  STAGE 3C: Parameter Extraction │
+         │  Промт: choose_parameter        │
+         │  или choose_parameter_depend    │
+         └────────┬────────────────────────┘
+                  │ Output: {"Parameters": {...}}
+                  ▼
+         ┌─────────────────────────────────┐
+         │  STAGE 4: Function Execution    │
+         │  Call_function()                │
+         └────────┬────────────────────────┘
+                  │ Result stored in previous_log
+                  ▼
+         ┌─────────────────────────────────┐
+         │  Добавить результат в           │
+         │  previous_log для след. задачи  │
+         └────────┬────────────────────────┘
+                  │
+                  └───► Следующая задача (если есть)
+
+         После выполнения всех задач:
+                  │
+                  ▼
+         ┌─────────────────────────────────┐
+         │  Финальный ответ из             │
+         │  последней задачи               │
+         └─────────────────────────────────┘
+```
+
+**Детальные этапы:**
+
+#### Stage 1: Task Decomposition
+
+**Промт:** `task_decompose(question, Tool_dic, model_name)`
+
+**Входные данные:**
+```python
+question = "Convert 23 km/h to X km/min by 'divide_', then multiply X by 45 to get Y"
+Tool_dic = [
+    {"name": "divide_", "description": "Divide two numbers"},
+    {"name": "multiply_", "description": "Multiply two numbers"}
+]
+```
+
+**Промт структура:**
+```
+You need to decompose a complex user's question into some simple subtasks.
+
+This is the user's question: {question}
+This is tool list: {Tool_list}
+
+Please note that:
+1. Decompose into simple subtasks with one tool each
+2. Write dependencies clearly (use X, Y variables)
+3. Output in JSON format: {"Tasks": [...]}
+
+Output:
+```
+
+**Выход LLM:**
+```json
+{
+  "Tasks": [
+    "Convert 23 km/h to X km/min by 'divide_'",
+    "Multiply X km/min by 45 min to get Y by 'multiply_'"
+  ]
+}
+```
+
+#### Stage 2: Task Topology
+
+**Промт:** `task_topology(question, task_ls, model_name)`
+
+**Входные данные:**
+- `question`: Оригинальный вопрос
+- `task_ls`: Результат Stage 1
+
+**Промт структура:**
+```
+Given a complex user's question, I have decomposed it into subtasks.
+There exists logical connections and order among the tasks.
+
+Output in JSON format:
+[{"task": task, "id": task_id, "dep": [dependency_ids]}]
+
+The "dep" field denotes ids of previous tasks that generate resources.
+If no dependencies, set "dep" to -1.
+
+This is user's question: {question}
+These are subtasks: {task_ls}
+Output:
+```
+
+**Выход LLM:**
+```json
+[
+  {
+    "task": "Convert 23 km/h to X km/min by 'divide_'",
+    "id": 0,
+    "dep": [-1]
+  },
+  {
+    "task": "Multiply X km/min by 45 min to get Y by 'multiply_'",
+    "id": 1,
+    "dep": [0]
+  }
+]
+```
+
+#### Stage 3: Tool Selection & Parameter Extraction
+
+**Для задачи 0 (без зависимостей):**
+
+**3A. Tool Selection:**
+```python
+tool_id = choose_tool(task["task"], Tool_dic, tool_used, model_name)
+# Output: {"ID": 1}  // divide_ tool
+```
+
+**3C. Parameter Extraction:**
+```python
+parameters = choose_parameter(API_instruction, api, api_dic, task["task"], model_name)
+# Output: {"Parameters": {"input": [23, 60]}}  # 23 km/h ÷ 60 = km/min
+```
+
+**Для задачи 1 (с зависимостями):**
+
+**3C. Parameter Extraction with Dependencies:**
+```python
+# previous_log содержит результат задачи 0
+previous_log = "Task 0 result: 0.383 km/min"
+
+parameters = choose_parameter_depend(
+    API_instruction, api, api_dic,
+    task["task"], model_name, previous_log
+)
+# Output: {"Parameters": {"input": [0.383, 45]}}  # используется результат задачи 0
+```
+
+#### Stage 4: Function Execution
+
+```python
+result = Call_function(function_name, parameters, task_id)
+# Выполняет функцию и возвращает результат
+
+# Для задачи 0: 23 / 60 = 0.383
+# Для задачи 1: 0.383 * 45 = 17.235
+```
+
+**Формат previous_log:**
+```python
+previous_log = f"""
+Task {task_id}:
+Question: {task["task"]}
+Function: {function_name}
+Parameters: {parameters}
+Result: {result}
+"""
+```
+
+---
+
+### 3.3 Pipeline 2: FuncQA One-Hop (Однохоп функции)
+
+**Назначение:** Простые вопросы, требующие одного вызова функции.
+
+**Упрощенная схема:**
+
+```
+┌──────────────────┐
+│  User Question   │
+└────────┬─────────┘
+         │
+         ▼
+┌─────────────────────────────────┐
+│  Tool Selection                 │
+│  Промт: choose_tool             │
+└────────┬────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────┐
+│  Parameter Extraction           │
+│  Промт: choose_parameter        │
+└────────┬────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────┐
+│  Function Execution             │
+└────────┬────────────────────────┘
+         │
+         ▼
+┌──────────────────┐
+│  Final Answer    │
+└──────────────────┘
+```
+
+**Отличия от Multi-Hop:**
+- ❌ Нет Stage 1 (Task Decomposition)
+- ❌ Нет Stage 2 (Task Topology)
+- ❌ Нет циклической обработки зависимостей
+- ✅ Прямой путь: Tool → Parameters → Execute → Answer
+
+---
+
+### 3.4 Pipeline 3: ToolBench (API оркестрация)
+
+**Назначение:** Последовательный вызов нескольких API для решения задачи.
+
+**Полная схема:**
+
+```
+┌──────────────────┐
+│  User Question   │
+│  + Tool Catalog  │
+└────────┬─────────┘
+         │
+         ▼
+┌─────────────────────────────────┐
+│  STAGE 1: Tool Selection        │
+│  Промт: choose_tool             │
+│  Выбрать ОДИН инструмент        │
+└────────┬────────────────────────┘
+         │ Output: {"ID": tool_id}
+         ▼
+┌─────────────────────────────────┐
+│  Load Tool Instruction          │
+│  tool_instruction.json          │
+└────────┬────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────┐
+│  STAGE 2: API Selection         │
+│  Промт: choose_API              │
+│  Выбрать несколько API          │
+│  из инструмента                 │
+└────────┬────────────────────────┘
+         │ Output: ["api1", "api2", ...]
+         │
+         └───► Цикл по выбранным API
+                │
+                ▼
+         ┌─────────────────────────────────┐
+         │  STAGE 3: Parameter Extraction  │
+         │  Промт: choose_parameter        │
+         │  (или _depend для последующих)  │
+         └────────┬────────────────────────┘
+                  │ Output: {"Parameters": {...}}
+                  ▼
+         ┌─────────────────────────────────┐
+         │  STAGE 4: API Execution         │
+         │  Call_function()                │
+         └────────┬────────────────────────┘
+                  │
+                  ▼
+         ┌─────────────────────────────────┐
+         │  STAGE 5: Answer Generation     │
+         │  Промт: answer_generation       │
+         │  (или _depend)                  │
+         └────────┬────────────────────────┘
+                  │
+                  ├──► Следующий API (если есть)
+                  │
+                  └──► Финальный ответ
+```
+
+**Ключевые особенности:**
+
+1. **Последовательная обработка API:**
+   - Первый API: используется `choose_parameter`
+   - Последующие API: используется `choose_parameter_depend` с логами
+
+2. **Answer Generation для каждого API:**
+   ```python
+   answer = answer_generation(question, API_instruction, call_result, model_name)
+   # Преобразует технический результат в естественный язык
+   ```
+
+3. **Cumulative previous_log:**
+   ```python
+   previous_log += f"""
+   API: {api_name}
+   Parameters: {parameters}
+   Result: {call_result}
+   Answer: {answer}
+   """
+   ```
+
+**Пример выполнения:**
+
+*Вопрос:* "Search for hotels in Paris and get reviews for the top result"
+
+*Stage 1 - Tool Selection:*
+```json
+{"ID": 15}  // "Hotels" tool
+```
+
+*Stage 2 - API Selection:*
+```json
+["search_hotels", "get_hotel_reviews"]
+```
+
+*Stage 3 - Parameters (API 1):*
+```json
+{"Parameters": {"location": "Paris", "limit": 10}}
+```
+
+*Stage 4 - Execution (API 1):*
+```json
+{"hotels": [{"id": "hotel_123", "name": "Le Hotel", ...}, ...]}
+```
+
+*Stage 5 - Answer Generation (API 1):*
+```
+"I found 10 hotels in Paris. The top result is Le Hotel (ID: hotel_123)."
+```
+
+*Stage 3 - Parameters (API 2) with dependency:*
+```python
+# previous_log содержит результат API 1
+{"Parameters": {"hotel_id": "hotel_123"}}  # Извлечено из previous_log
+```
+
+*Stage 4 - Execution (API 2):*
+```json
+{"reviews": [{"rating": 4.5, "text": "Great location!"}, ...]}
+```
+
+*Stage 5 - Final Answer Generation:*
+```
+"The reviews for Le Hotel are mostly positive with an average rating of 4.5..."
+```
+
+---
+
+### 3.5 Pipeline 4: ToolBench with RAG (Retrieval-Augmented)
+
+**Назначение:** То же, что ToolBench, но с семантическим поиском релевантных API.
+
+**Отличия от обычного ToolBench:**
+
+```
+┌──────────────────────────────────────────────────────┐
+│  STAGE 1: Tool Selection (same as ToolBench)         │
+└────────┬─────────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────────────────────┐
+│  NEW: Semantic Retrieval                             │
+│  ══════════════════════                              │
+│  1. Embed user question                              │
+│  2. Compute similarity with all APIs in tool         │
+│  3. Select top-K most relevant APIs                  │
+└────────┬─────────────────────────────────────────────┘
+         │ Filtered API list (top-K relevant)
+         ▼
+┌──────────────────────────────────────────────────────┐
+│  STAGE 2: API Selection (with filtered list)        │
+│  Промт: choose_API                                   │
+│  Выбрать из релевантных API                         │
+└────────┬─────────────────────────────────────────────┘
+         │
+         └──► Rest is same as ToolBench
+```
+
+**Semantic Retrieval детали:**
+
+```python
+# 1. Получить эмбеддинги всех API
+api_descriptions = [api["description"] for api in tool_apis]
+api_embeddings = get_embeddings(api_descriptions)
+
+# 2. Эмбеддинг вопроса
+question_embedding = get_embedding(question)
+
+# 3. Вычислить косинусное сходство
+similarities = cosine_similarity([question_embedding], api_embeddings)[0]
+
+# 4. Топ-K релевантных
+top_k_indices = similarities.argsort()[-retrieval_num:][::-1]
+filtered_apis = [tool_apis[i] for i in top_k_indices]
+
+# 5. Передать только релевантные API в промт
+```
+
+**Преимущества:**
+- Уменьшение контекста промта (только релевантные API)
+- Более точный выбор API
+- Работает с инструментами, имеющими 100+ API
+
+---
+
+### 3.6 Pipeline 5: RestBench (REST API декомпозиция)
+
+**Назначение:** Работа с реальными REST API (Spotify, TMDB) через декомпозицию задач.
+
+**Полная схема:**
+
+```
+┌──────────────────┐
+│  User Question   │
+│  + API List      │
+└────────┬─────────┘
+         │
+         ▼
+┌─────────────────────────────────┐
+│  STAGE 1: Task Decomposition    │
+│  Промт: task_decompose          │
+│  С указанием ID инструментов    │
+└────────┬────────────────────────┘
+         │ Output: [{"Task": "...", "ID": 15}, ...]
+         ▼
+┌─────────────────────────────────┐
+│  STAGE 2: Execution Loop        │
+│  Для каждой подзадачи           │
+└────────┬────────────────────────┘
+         │
+         └───► Сохранить путь инструментов
+
+         ▼
+┌──────────────────┐
+│  Output:         │
+│  tool_choice_ls  │
+└──────────────────┘
+```
+
+**Промт для Task Decomposition:**
+
+```
+We have spotify database and the following tools:
+{Tool_dic}
+
+You need to decompose a complex user's question into simple subtasks
+and let the model execute it step by step with these tools.
+
+Please note that:
+1. Break down into subtasks using tools mentioned above
+2. List the ID of the tool used for each subtask
+3. If no tool needed, use {"ID": -1}
+4. Consider logical connections, order and constraints
+5. Output in JSON format:
+   [{"Task": "...", "ID": 15}, {"Task": "...", "ID": 19}]
+
+Example:
+Question: Pause the player
+Output: [
+  {"Task": "Get current playback state", "ID": 15},
+  {"Task": "Pause playback", "ID": 19}
+]
+
+This is the user's question: {question}
+Output:
+```
+
+**Выход:**
+
+```json
+[
+  {"Task": "Search for song 'Bohemian Rhapsody'", "ID": 5},
+  {"Task": "Add song to queue", "ID": 12},
+  {"Task": "Play the queue", "ID": 19}
+]
+```
+
+**Извлечение tool path:**
+
+```python
+tool_choice_ls = []
+for task in task_path:
+    if task["ID"] != -1 and task["ID"] in dic_tool:
+        tool_choice_ls.append(dic_tool[task["ID"]]['tool_usage'])
+
+# Output: ["search_track", "add_to_queue", "start_playback"]
+```
+
+**Отличия от других пайплайнов:**
+- ✅ Специализирован для REST API
+- ✅ ID инструментов в промте
+- ❌ Нет фактического выполнения (только планирование)
+- ❌ Нет parameter extraction (упрощенный вариант)
+
+---
+
+### 3.7 Сравнительная таблица всех EasyTool пайплайнов
+
+| Аспект | FuncQA-MH | FuncQA-OH | ToolBench | ToolBench-RAG | RestBench |
+|--------|-----------|-----------|-----------|---------------|-----------|
+| **Декомпозиция** | ✅ 2 этапа | ❌ | ❌ | ❌ | ✅ 1 этап |
+| **Топология зависимостей** | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **Tool Selection** | ✅ | ✅ | ✅ | ✅ | ❌ (ID в промте) |
+| **API Selection** | ❌ | ❌ | ✅ | ✅ | ❌ |
+| **Parameter Extraction** | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Retrieval** | ❌ | ❌ | ❌ | ✅ Semantic | ❌ |
+| **Execution** | ✅ Python funcs | ✅ Python funcs | ✅ Real APIs | ✅ Real APIs | ❌ Planning only |
+| **Answer Generation** | ❌ | ❌ | ✅ Per API | ✅ Per API | ❌ |
+| **Previous Log** | ✅ Cumulative | ❌ | ✅ Cumulative | ✅ Cumulative | ❌ |
+| **Retry Mechanism** | ✅ Max 10 | ✅ Max 10 | ✅ Max 10 | ✅ Max 10 | ✅ Max 10 |
+
+---
+
+### 3.8 Данные между этапами: Детальный пример
+
+**Сценарий:** ToolBench - "Book a hotel in Paris for 2 nights"
+
+**Stage 1 Output (Tool Selection):**
+```json
+{"ID": 23}
+```
+
+**Tool Instruction Loading:**
+```json
+{
+  "tool_id": 23,
+  "tool_name": "Hotels API",
+  "tool_description": "Search and book hotels worldwide",
+  "apis": [
+    {
+      "name": "search_hotels",
+      "description": "Search for hotels by location",
+      "parameters": {
+        "required": ["location"],
+        "optional": ["check_in", "check_out", "guests"]
+      }
+    },
+    {
+      "name": "get_hotel_details",
+      "description": "Get detailed information about a hotel",
+      "parameters": {
+        "required": ["hotel_id"]
+      }
+    },
+    {
+      "name": "book_hotel",
+      "description": "Book a hotel room",
+      "parameters": {
+        "required": ["hotel_id", "check_in", "check_out"]
+      }
+    }
+  ]
+}
+```
+
+**Stage 2 Output (API Selection):**
+```json
+["search_hotels", "book_hotel"]
+```
+
+**API 1 Execution:**
+
+*Stage 3 - Parameter Extraction:*
+```json
+{
+  "Parameters": {
+    "location": "Paris",
+    "guests": 2
+  }
+}
+```
+
+*Stage 4 - API Call Result:*
+```json
+{
+  "hotels": [
+    {"id": "h_123", "name": "Paris Hotel", "price": 150},
+    {"id": "h_456", "name": "Eiffel Tower Inn", "price": 200}
+  ]
+}
+```
+
+*Stage 5 - Answer Generation:*
+```
+"I found 2 hotels in Paris. The most affordable option is Paris Hotel at $150 per night (ID: h_123)."
+```
+
+*Previous Log Update:*
+```
+API: search_hotels
+Question: Book a hotel in Paris for 2 nights
+Parameters: {"location": "Paris", "guests": 2}
+Result: {"hotels": [{"id": "h_123", "name": "Paris Hotel"...}]}
+Answer: I found 2 hotels in Paris. The most affordable option is Paris Hotel at $150 per night (ID: h_123).
+```
+
+**API 2 Execution:**
+
+*Stage 3 - Parameter Extraction with Dependencies:*
+```python
+# LLM видит previous_log и извлекает hotel_id
+```
+
+```json
+{
+  "Parameters": {
+    "hotel_id": "h_123",
+    "check_in": "2024-01-15",
+    "check_out": "2024-01-17"
+  }
+}
+```
+
+*Stage 4 - API Call Result:*
+```json
+{
+  "booking_id": "bk_789",
+  "confirmation": "Your booking is confirmed",
+  "total_price": 300
+}
+```
+
+*Stage 5 - Final Answer:*
+```
+"Your hotel booking is confirmed! Booking ID: bk_789. You'll stay at Paris Hotel from Jan 15 to Jan 17. Total cost: $300 for 2 nights."
+```
+
+---
+
